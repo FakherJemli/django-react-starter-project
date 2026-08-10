@@ -1,0 +1,47 @@
+name: Weekly Dependency Audit
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'  # Every Monday at 08:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install pip-audit
+      - name: npm audit (frontend)
+        run: npm ci --legacy-peer-deps && npm audit --audit-level=high
+        working-directory: ./frontend
+        continue-on-error: true
+      - name: pip-audit (backend)
+        run: pip-audit -r ./backend/requirements.txt --vulnerability-service pypi
+        continue-on-error: true
+
+      - name: Open issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '\uD83D\uDD12 Dependency vulnerabilities detected in weekly audit',
+              body: 'Weekly dependency audit found vulnerabilities. See run: ' + context.serverUrl + '/' + context.repo.owner + '/' + context.repo.repo + '/actions/runs/' + context.runId,
+              labels: ['security', 'dependencies']
+            })

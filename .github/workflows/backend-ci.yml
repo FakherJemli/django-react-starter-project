@@ -1,0 +1,507 @@
+name: Python CI/CD
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      enforce-tests:
+        description: 'Fail the pipeline when tests fail. Default (false) still RUNS the tests but only reports failures.'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-backend-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+# CIFIX-14: least privilege by default. Without a workflow-level block the
+# GITHUB_TOKEN falls back to the repository's default permissions, which is
+# still read/write on many older organisations. Individual jobs widen this
+# where they genuinely need to (packages: write on docker, security-events:
+# write on the scan jobs).
+permissions:
+  contents: read
+
+jobs:
+
+# ── Dependency Audit (parallel with ci) ─────────────────────────────────────
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ./backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: ./backend/requirements*.txt
+      - name: Install pip-audit
+        run: pip install pip-audit
+      - name: Audit dependencies
+        # DevOpsGen: audit-grace-period-until: 2026-11-08
+        run: |
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt --vulnerability-service pypi
+          else
+            echo "No requirements.txt - auditing the installed environment instead"
+            pip-audit --vulnerability-service pypi
+          fi
+        continue-on-error: true
+
+# ── Job 1: compile + test  (push AND pull_request) ──────────────────────────
+  ci:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ./backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: ./backend/requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install test runner (fallback — pytest not declared as a project dependency)
+        run: pip install pytest
+
+      - name: Run tests
+        id: tests
+        run: python -m pytest -q --junitxml=reports/junit.xml
+        continue-on-error: ${{ github.event.inputs.enforce-tests != 'true' }}
+      - name: Report test outcome
+        if: always()
+        run: |
+          MODE=advisory
+          if [ "${{ github.event.inputs.enforce-tests }}" = "true" ]; then
+            MODE=enforced
+          fi
+          OUTCOME="${{ steps.tests.outcome }}"
+          {
+            echo "### Tests: $OUTCOME"
+            echo ""
+            if [ "$OUTCOME" = "success" ]; then
+              echo "All executed tests passed."
+            elif [ "$MODE" = "enforced" ]; then
+              echo "Tests FAILED and enforce-tests=true, so this pipeline is failing."
+            else
+              echo "Tests FAILED, but enforce-tests is false so the pipeline is NOT blocked."
+              echo "A green check here does NOT mean the tests passed."
+              echo "Re-run via 'Run workflow' with enforce-tests=true to make failures blocking."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Test step outcome=$OUTCOME (mode=$MODE)"
+
+      - name: Upload JUnit test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-results-${{ github.job }}
+          path: |
+            reports/junit.xml
+          retention-days: 3
+          if-no-files-found: ignore
+
+
+# ─── Job 2: build + push Docker image to GHCR  (push to main/master only) ────
+  docker:
+    name: Build & Push Image
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write    # required to push to ghcr.io
+    outputs:
+      image: ${{ steps.img.outputs.name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR requires all-lowercase image names
+      - name: Normalise image name
+        id: img
+        run: |
+          echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.img.outputs.name }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags:   ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+# ─── Job 3: Trivy security scan (push only, after docker) ────────────────────
+
+  trivy-scan:
+    name: Security scan (Trivy)
+    needs: docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+
+    outputs:
+      grade:    ${{ steps.grade.outputs.grade }}
+      critical: ${{ steps.grade.outputs.critical }}
+      high:     ${{ steps.grade.outputs.high }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy image scan
+        id: trivy
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          scan-type:      image
+          image-ref:      ${{ needs.docker.outputs.image }}:sha-${{ github.sha }}
+          format:         sarif
+          output:         trivy-results.sarif
+          exit-code:      1
+          ignore-unfixed: true
+          severity:       CRITICAL,HIGH,MEDIUM,LOW
+        continue-on-error: true
+
+      - name: Generate CycloneDX SBOM
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          scan-type:  image
+          image-ref:  ${{ needs.docker.outputs.image }}:sha-${{ github.sha }}
+          format:     cyclonedx
+          output:     sbom.cyclonedx.json
+        continue-on-error: true
+
+      - name: Upload SBOM artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cyclonedx.json
+          retention-days: 90
+          if-no-files-found: ignore
+        continue-on-error: true
+    
+      - name: Compute grade and write outputs
+        id: grade
+        if: always()
+        run: |
+          python3 -c "
+          import json, os, sys
+          sarif_path = 'trivy-results.sarif'
+          critical_ids = []
+          if not os.path.exists(sarif_path):
+              print('SARIF file not found — defaulting grade to F (fail-closed)')
+              g, c, h, m, l = 'F', 0, 0, 0, 0
+          else:
+              try:
+                  data = json.load(open(sarif_path))
+              except Exception as exc:
+                  print(f'SARIF parse error: {exc} — defaulting grade to F (fail-closed)')
+                  g, c, h, m, l = 'F', 0, 0, 0, 0
+              else:
+                  runs  = data.get('runs', [{}])
+                  rules = {r['id']: r
+                           for r in runs[0].get('tool',{}).get('driver',{}).get('rules',[])}
+                  c = h = m = l = 0
+                  for run in runs:
+                      for res in run.get('results', []):
+                          rule_id = res.get('ruleId', '')
+                          sev = (rules.get(rule_id, {})
+                                       .get('properties', {})
+                                       .get('security-severity', ''))
+                          try:    flt = float(sev)
+                          except: flt = 0.0
+                          if   flt >= 9.0:
+                              c += 1
+                              if rule_id and len(critical_ids) < 10:
+                                  critical_ids.append(rule_id)
+                          elif flt >= 7.0: h += 1
+                          elif flt >= 4.0: m += 1
+                          else:            l += 1
+                  # Grade rubric — must stay in sync with _compute_grade() in
+                  # analyzer.py and SecurityScanService.computeGrade() in Java
+                  if   c >= 5:               g = 'F'
+                  elif c >= 3:               g = 'D'
+                  elif c >= 1:               g = 'C'
+                  elif h > 5 or m > 25:      g = 'C'
+                  elif h > 2 or m > 10:      g = 'B'
+                  else:                      g = 'A'
+          out = os.environ.get('GITHUB_OUTPUT', '')
+          if out:
+              with open(out, 'a') as fh:
+                  fh.write(f'critical={c}\nhigh={h}\nmedium={m}\nlow={l}\ngrade={g}\n')
+                  fh.write('critical_cve_ids=' + ','.join(critical_ids) + '\n')
+          print(f'Trivy result: C={c} H={h} M={m} L={l} grade={g}')
+          "
+
+      - name: Upload SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+        continue-on-error: true
+
+      - name: POST results to DevOpsGen backend
+        if: always()
+        env:
+          SCAN_URL:     ${{ vars.DEVOPSGEN_SCAN_CALLBACK_URL }}
+          PROJECT_ID:   ${{ vars.DEVOPSGEN_PROJECT_ID }}
+          GRADE:        ${{ steps.grade.outputs.grade }}
+          CRITICAL:     ${{ steps.grade.outputs.critical }}
+          HIGH:         ${{ steps.grade.outputs.high }}
+          MEDIUM:       ${{ steps.grade.outputs.medium }}
+          LOW:          ${{ steps.grade.outputs.low }}
+          SCAN_REF:     ${{ github.sha }}
+          CRITICAL_CVE_IDS: ${{ steps.grade.outputs.critical_cve_ids }}
+        run: |
+          if [ -z "$SCAN_URL" ]; then
+            echo "DEVOPSGEN_SCAN_CALLBACK_URL not set — skipping backend callback"
+            exit 0
+          fi
+          # CIFIX-16: the payload used to be passed as an inline
+          # double-quoted -d argument whose inner quotes were NOT escaped
+          # for the shell. bash concatenates the adjacent quoted/unquoted
+          # runs and strips every one of those quotes, so what actually
+          # reached the backend was {projectId:abc,scanType:fs,...} —
+          # unquoted keys and values, i.e. not JSON at all, rejected on
+          # arrival. A heredoc needs no quote escaping and still expands
+          # the environment variables above.
+          curl -sf -X POST "$SCAN_URL" -H "Content-Type: application/json" -d @- <<PAYLOAD || echo "Backend callback failed (non-fatal)"
+          {"projectId":"$PROJECT_ID","scanType":"image","critical":${CRITICAL:-0},"high":${HIGH:-0},"medium":${MEDIUM:-0},"low":${LOW:-0},"grade":"${GRADE:-F}","status":"SUCCEEDED","scanRef":"$SCAN_REF","origin":"ci","criticalCveIds":"$CRITICAL_CVE_IDS"}
+          PAYLOAD
+
+
+# ─── Job 4: SSH deploy to VPS  (only when SSH_HOST secret is configured) ──────
+#            NOTE: depends on trivy-scan so a failing scan blocks deployment.
+#            Fail-closed: if the grade output is empty (scan could not compute
+#            a result), deployment is also blocked.
+  deploy:
+    name: Deploy to Server
+    needs: [ci, docker, trivy-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production   # optional: add protection rules in Settings → Environments
+    permissions:
+      contents: read
+    if: |
+      github.event_name == 'push' &&
+      needs.trivy-scan.outputs.grade != '' &&
+      needs.trivy-scan.outputs.grade != 'F' &&
+      needs.trivy-scan.outputs.grade != 'D'
+
+    steps:
+      - name: Deploy via SSH
+        if: env.SSH_HOST != ''
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -u
+            IMAGE="${{ needs.docker.outputs.image }}:sha-${{ github.sha }}"
+            APP_PORT="8000"
+            HEALTH_STRATEGY="tcp"
+            HEALTH_PATH=""
+            HEALTH_RETRIES=12
+            HEALTH_INTERVAL=5
+
+            echo "── DevOpsGen deployment ────────────────────────────────"
+            echo "Image             : $IMAGE"
+            echo "Container port    : $APP_PORT"
+            echo "Health strategy   : $HEALTH_STRATEGY"
+            echo "Strategy chosen because: no health route found in the django source — falling back to a TCP readiness check; verifying the port accepts connections instead"
+
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+            # Remember what is currently serving traffic BEFORE touching it.
+            PREV_IMAGE=$(docker inspect --format '{{.Config.Image}}' app 2>/dev/null || echo "")
+            echo "Previously deployed image: ${PREV_IMAGE:-<none>}"
+
+            echo "Pulling $IMAGE ..."
+            docker pull "$IMAGE"
+
+            # Park the old container instead of destroying it, so rollback is
+            # a rename away rather than a re-pull of an image that may be gone.
+            docker rm -f app_previous 2>/dev/null || true
+            docker stop app 2>/dev/null || true
+            docker rename app app_previous 2>/dev/null || true
+
+            docker run -d --name app --restart unless-stopped \
+              -p "$APP_PORT":"$APP_PORT" \
+              "$IMAGE"
+
+            # ── Health verification ──────────────────────────────────────
+            # An image that ships its own HEALTHCHECK is the most reliable
+            # signal available, so prefer it at RUNTIME regardless of which
+            # strategy was selected at generation time.
+            image_has_healthcheck() {
+              [ "$(docker inspect --format '{{if .Config.Healthcheck}}yes{{end}}' app 2>/dev/null)" = "yes" ]
+            }
+
+            # 0 = healthy, 1 = not ready yet, 2 = definitively unhealthy
+            probe_once() {
+              if image_has_healthcheck; then
+                STATUS=$(docker inspect --format '{{.State.Health.Status}}' app 2>/dev/null || echo "")
+                [ "$STATUS" = "healthy" ]   && return 0
+                [ "$STATUS" = "unhealthy" ] && return 2
+                return 1
+              fi
+              case "$HEALTH_STRATEGY" in
+                http)
+                  CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+                         "http://127.0.0.1:$APP_PORT$HEALTH_PATH" 2>/dev/null || echo 000)
+                  case "$CODE" in
+                    2??|3??) return 0 ;;
+                    *)       return 1 ;;
+                  esac
+                  ;;
+                tcp)
+                  # Any HTTP answer at all proves the app is accepting and
+                  # replying; fall back to a bare TCP connect for non-HTTP apps.
+                  if curl -s -o /dev/null --max-time 5 "http://127.0.0.1:$APP_PORT/" 2>/dev/null; then
+                    return 0
+                  fi
+                  if command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 "$APP_PORT" 2>/dev/null; then
+                    return 0
+                  fi
+                  return 1
+                  ;;
+                *)
+                  docker ps -q --filter "name=^app$" --filter status=running | grep -q . && return 0
+                  return 1
+                  ;;
+              esac
+            }
+
+            if [ "$HEALTH_STRATEGY" = "http" ]; then
+              echo "Verifying http://127.0.0.1:$APP_PORT$HEALTH_PATH ..."
+            fi
+
+            HEALTHY=0
+            ATTEMPT=0
+            while [ "$ATTEMPT" -lt "$HEALTH_RETRIES" ]; do
+              ATTEMPT=$((ATTEMPT + 1))
+              # A container that exited will never become healthy — stop early.
+              if ! docker ps -q --filter "name=^app$" --filter status=running | grep -q .; then
+                echo "  attempt $ATTEMPT/$HEALTH_RETRIES — container is not running" >&2
+                break
+              fi
+              probe_once
+              RC=$?
+              if [ "$RC" -eq 0 ]; then
+                HEALTHY=1
+                break
+              fi
+              if [ "$RC" -eq 2 ]; then
+                echo "  container reported HEALTHCHECK status=unhealthy — aborting early" >&2
+                break
+              fi
+              echo "  attempt $ATTEMPT/$HEALTH_RETRIES — not ready yet..."
+              sleep "$HEALTH_INTERVAL"
+            done
+
+            if [ "$HEALTHY" -eq 1 ]; then
+              echo "Deployment VERIFIED via $HEALTH_STRATEGY at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              docker rm -f app_previous 2>/dev/null || true
+              # Only prune once the new release is confirmed good, so the
+              # rollback image is never collected out from under us.
+              docker image prune -f
+              exit 0
+            fi
+
+            echo "ERROR: health verification FAILED after $HEALTH_RETRIES attempts." >&2
+            echo "── container logs (last 60 lines) ──" >&2
+            docker logs app 2>&1 | tail -60 || true
+            docker rm -f app 2>/dev/null || true
+
+            if docker inspect app_previous >/dev/null 2>&1; then
+              echo "ROLLBACK: restoring the previous container ($PREV_IMAGE)" >&2
+              docker rename app_previous app
+              if docker start app; then
+                echo "ROLLBACK COMPLETE — the previous release is serving again." >&2
+              else
+                echo "ROLLBACK FAILED — manual intervention required." >&2
+              fi
+            else
+              echo "No previous container to roll back to — the service is DOWN." >&2
+            fi
+            exit 1
+
+# ── Test Report Annotations (TENT-2) ─────────────────────────────────────────
+  test-report:
+    name: Test Report
+    needs: [ci]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    steps:
+      - name: Download JUnit results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: junit-results-*
+          path: junit-artifacts
+          merge-multiple: true
+      - name: Publish test report
+        uses: dorny/test-reporter@v1
+        if: always()
+        continue-on-error: true
+        with:
+          name: Test Results
+          path: 'junit-artifacts/**/junit.xml'
+          reporter: java-junit
+          fail-on-error: false
+          fail-on-empty: false
